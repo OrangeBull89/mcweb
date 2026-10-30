@@ -8,7 +8,7 @@ database_name = "mcweb"
 database_id = "0e9d1d63-6b72-46e1-9cc7-57e12a769c6b"   # printed by: npx wrangler d1 create mcweb
 
 [vars]
-HEAD_ADMIN = "change_me"      # the username that becomes head admin when it registers (register it first)
+HEAD_ADMIN = "HEAD_ADMIN"      # the username that becomes head admin when it registers (register it first)
 PBKDF2_ITERS = "50000"        # password hashing rounds; 50000 fits Cloudflare's free CPU limit. Up to 100000 on a paid plan
 DOWNLOADS_URL = ""            # optional first-run value; later edit in Admin > Site (must be a drive.google.com link)
 UPDATE_URL = ""
