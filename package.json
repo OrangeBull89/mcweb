@@ -1,0 +1,10 @@
+{
+  "name": "mcweb-launcher",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "dev": "node --no-warnings dev/server.mjs",
+    "test": "node --no-warnings test/run.mjs"
+  }
+}

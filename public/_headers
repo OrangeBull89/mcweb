@@ -1,0 +1,11 @@
+# Cloudflare Pages reads this file. Strict rules for the launcher; game pages under /games/ get their own (looser) policy later.
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Permissions-Policy: camera=(self), microphone=(self), display-capture=(self), geolocation=()
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://cdn.jsdelivr.net; font-src 'self'; connect-src 'self' wss: https://cdn.jsdelivr.net; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'
+
+/games/*
+  ! Content-Security-Policy
+  ! X-Frame-Options

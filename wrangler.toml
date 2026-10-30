@@ -1,0 +1,16 @@
+name = "mcweb"
+compatibility_date = "2024-11-01"
+pages_build_output_dir = "./public"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mcweb"
+database_id = "PASTE-YOUR-D1-ID-HERE"   # printed by: npx wrangler d1 create mcweb
+
+[vars]
+HEAD_ADMIN = "change_me"      # the username that becomes head admin when it registers (register it first)
+PBKDF2_ITERS = "50000"        # password hashing rounds; 50000 fits Cloudflare's free CPU limit. Up to 100000 on a paid plan
+DOWNLOADS_URL = ""            # optional first-run value; later edit in Admin > Site (must be a drive.google.com link)
+UPDATE_URL = ""
+BANNER = ""
+# The sign-up phrase is a secret, set with:  npx wrangler pages secret put SIGNUP_PHRASE --project-name mcweb
