@@ -4,6 +4,8 @@ import { HttpError, json, MAX_BODY, SESSION_MS, NAME_RE, randomHex, sha256, safe
   createSession, requireUser, blockReason, publicMe, prefsOf, cleanPrefs, validAvatar, siteInfo, clientSite, adminPerms } from "../_lib/core.js";
 import { socialRoutes, buildSync } from "../_lib/social.js";
 import { adminRoutes, gamesFor } from "../_lib/admin.js";
+import { serverRoutes } from "../_lib/servers.js";
+import { voiceRoutes } from "../_lib/voice.js";
 
 const routes = {
   async site({ db, env }) { return json(clientSite(await siteInfo(db, env))); },
@@ -54,7 +56,7 @@ const routes = {
     const perms = await adminPerms(db, env, u);
     return json({
       me: publicMe(u), head: perms === "all", admin: perms === "all" ? "all" : perms.length ? perms : null, prefs: prefsOf(u),
-      games: await gamesFor(db, env, u), site: clientSite(await siteInfo(db, env)), now: Date.now(),
+      games: await gamesFor(db, env, u), site: clientSite(await siteInfo(db, env)), now: Date.now(), rt: env.RT_MODE === "ws" ? "ws" : "poll",
     });
   },
 
@@ -125,6 +127,8 @@ const routes = {
   },
 
   ...socialRoutes,
+  ...serverRoutes,
+  ...voiceRoutes,
   ...adminRoutes,
 };
 

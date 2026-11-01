@@ -24,6 +24,7 @@
   let legacy = null;
   try { legacy = localStorage.getItem(LEGACY_KEY); } catch {}
   async function api(route, body = {}, opts = {}) {
+    if (core.rtMode === "poll" && route.startsWith("voice_")) await sendQueue; // a "leave" sent a moment ago must land before this join
     const headers = { "content-type": "application/json", "x-launcher": "1" };
     if (legacy) headers.authorization = "Bearer " + legacy;
     let res;
@@ -201,7 +202,40 @@
   // ---- live socket ----
   let ws = null;
   let wsDelay = 2000;
+
+  // ---- live events without a socket (used when boot.rt === "poll") ----
+  // The tab asks the server for new events every couple of seconds (once a second in a call). Cheap: a read or two.
+  // Signalling and call state go back through the "rt" route, in order.
+  let pollOn = false, pollTimer = null, pollCursor = null, pollOkAt = 0, outage = false, sendQueue = Promise.resolve();
+  let kickPoll = () => {};
+  const randomConn = () => [...crypto.getRandomValues(new Uint8Array(12))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const inCall = () => { const v = globalThis.LauncherSocial?.voice; return !!(v && (v.room || v.joining || v.reconnecting)); };
+  function stopPoll() { pollOn = false; clearTimeout(pollTimer); core.rtMode = null; kickPoll = () => {}; }
+  function startPoll() {
+    if (pollOn) return;
+    pollOn = true; pollCursor = null; pollOkAt = Date.now(); outage = false;
+    core.rtMode = "poll"; core.conn = randomConn(); emit("conn", core.conn);
+    const loop = async () => {
+      if (!pollOn || !core.boot) return;
+      let wait = document.hidden ? 12_000 : inCall() ? 1000 : 2500;
+      try {
+        const out = await api("rt_poll", { conn: core.conn, after: pollCursor, voice: inCall() ? 1 : 0 });
+        pollCursor = out.cursor; pollOkAt = Date.now();
+        if (!core.wsUp) { core.wsUp = true; emit("socket", true); if (outage) { outage = false; emit("conn", core.conn); } }
+        for (const ev of out.events) onEvent(ev);
+      } catch {
+        wait = 4000;
+        // a short hiccup is fine; after ~25 s the server has dropped us from any call, so tell the voice code
+        if (core.wsUp && Date.now() - pollOkAt > 25_000) { core.wsUp = false; outage = true; emit("socket", false); }
+      }
+      if (pollOn) pollTimer = setTimeout(loop, wait);
+    };
+    kickPoll = () => { clearTimeout(pollTimer); loop(); };
+    loop();
+  }
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && pollOn) kickPoll(); });
   function closeWs() {
+    stopPoll();
     const s = ws;
     ws = null;
     core.wsUp = false;
@@ -210,6 +244,7 @@
   }
   function connectWs() {
     if (!core.boot || ws) return;
+    if (core.boot.rt === "poll") { startPoll(); return; }
     let sock;
     try { sock = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`); } catch { return; }
     ws = sock;
@@ -228,8 +263,12 @@
       wsDelay = Math.min(wsDelay * 2, 60_000);
     };
   }
-  core.send = (msg) => { if (ws && core.wsUp) { try { ws.send(JSON.stringify(msg)); return true; } catch {} } return false; };
-  setInterval(() => { if (core.wsUp) try { ws.send("ping"); } catch {} }, 30_000);
+  core.send = (msg) => {
+    if (core.rtMode === "poll") { sendQueue = sendQueue.then(() => api("rt", { conn: core.conn, msg })).catch(() => {}); return true; }
+    if (ws && core.wsUp) { try { ws.send(JSON.stringify(msg)); return true; } catch {} }
+    return false;
+  };
+  setInterval(() => { if (core.wsUp && ws) try { ws.send("ping"); } catch {} }, 30_000);
 
   function onEvent(ev) {
     switch (ev.t) {
@@ -305,7 +344,7 @@
     ticks++;
     const beat = core.wsUp ? ticks % 9 === 0 : ticks % 3 === 0;
     if (beat || isIdle() !== wasIdle || gameMoved()) sync();
-    if (!core.wsUp) emit("poll");
+    if (!core.wsUp || (core.rtMode === "poll" && ticks % 3 === 0)) emit("poll"); // polling mode also refreshes the open chat every 15 s as a safety net
   }, 5000);
 
   // ---- small shared helpers for the UIs ----

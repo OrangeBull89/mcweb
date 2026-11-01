@@ -1,9 +1,12 @@
 // Social routes: presence, friends, blocking, DMs, group chats, reactions, pins, pictures, profiles.
 import { HttpError, json, requireUser, publicMe, randomHex, tooMany, recordFail, blockReason } from "./core.js";
+import { P, has, channelCtx, serverSummary, pendingInvites } from "./access.js";
+import { emitUsers, notifyChat, notifyMentions, friendIds } from "./events.js";
 
 const PRESENCE_TTL = 100_000; // clients sync at least every 45 s, so silence for 100 s means gone
 const MSG_MAX = 2000, PAGE = 50, PURGE_MAX = 100, PARTY_MAX = 10, IMG_MAX = 700_000;
 const SPECIAL = /^::(img|invite|ask)::/;
+const typingAt = new Map(); // per-isolate: at most one typing event per chat every 2 s
 
 export const dmChat = (a, b) => `dm:${Math.min(a, b)}:${Math.max(a, b)}`;
 const pair = (a, b) => [Math.min(a, b), Math.max(a, b)];
@@ -24,7 +27,7 @@ export function shownStatus(row, now = Date.now()) {
   if (row.status === "away" || row.idle_since) return "away";
   return "online";
 }
-const userView = (row, now) => {
+export const userView = (row, now) => {
   const status = shownStatus(row, now), off = status === "offline";
   return {
     id: row.id, name: row.name, avatar: publicMe(row).avatar, status, lastSeen: row.last_seen || null,
@@ -33,15 +36,17 @@ const userView = (row, now) => {
     playingWith: off ? null : row.playing_with || null, worldName: off ? null : row.world_name || null, since: off ? null : row.game_since || null,
   };
 };
-const PRES_COLS = "p.idle_since, p.game, p.activity, p.world_code, p.playing_with, p.world_name, p.game_since";
+export const PRES_COLS = "p.idle_since, p.game, p.activity, p.world_code, p.playing_with, p.world_name, p.game_since";
 
 export async function savePresence(db, u, body) {
   const now = Date.now();
   if (body.leaving) {
     await db.prepare("UPDATE users SET last_seen = 0 WHERE id = ?").bind(u.id).run();
     await db.prepare("DELETE FROM presence WHERE user_id = ?").bind(u.id).run();
+    await emitUsers(db, await friendIds(db, u.id), { t: "presence", name: u.name });
     return;
   }
+  const wasStatus = u.status, wasSeen = u.last_seen;
   const sets = ["last_seen = ?"], args = [now];
   if (typeof body.status === "string" && ["online", "away", "dnd", "invisible"].includes(body.status)) { sets.push("status = ?"); args.push(body.status); u.status = body.status; }
   await db.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...args, u.id).run();
@@ -60,6 +65,9 @@ export async function savePresence(db, u, body) {
   await db.prepare(`INSERT INTO presence (user_id, idle_since, game, activity, world_code, playing_with, world_name, game_since) VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT(user_id) DO UPDATE SET idle_since=excluded.idle_since, game=excluded.game, activity=excluded.activity, world_code=excluded.world_code, playing_with=excluded.playing_with, world_name=excluded.world_name, game_since=excluded.game_since`)
     .bind(u.id, next.idle_since, next.game, next.activity, next.world_code, next.playing_with, next.world_name, next.game_since).run();
+  const cameOnline = !wasSeen || now - wasSeen > PRESENCE_TTL;
+  if (cameOnline || u.status !== wasStatus || next.game !== (cur?.game ?? null) || (next.idle_since ? 1 : 0) !== (cur?.idle_since ? 1 : 0))
+    await emitUsers(db, await friendIds(db, u.id), { t: "presence", name: u.name });
 }
 
 // ---------- the big "sync" payload ----------
@@ -112,19 +120,26 @@ export async function buildSync(db, u) {
     parties.push({ id: p.id, name: p.name, owner, mine: p.owner === u.id, members, unread: partyUnread.get(p.id) || 0, lastAt: last?.t || 0 });
   }
 
-  return { me: { ...publicMe(u), status: u.status }, friends, dms, parties, servers: [], incoming, outgoing, blocked: blockedRows.map((b) => b.name), serverInvites: [], unread, deviceId: u.sid };
+  const sv = await serverSummary(db, u);
+  return { me: { ...publicMe(u), status: u.status }, friends, dms, parties, servers: sv.servers, incoming, outgoing, blocked: blockedRows.map((b) => b.name), serverInvites: await pendingInvites(db, u), unread, deviceId: u.sid };
 }
+
+const isPrivate = (c) => !!c.channel && c.channel.overwrites.some((o) => o.kind === "role" && o.target === c.acc.everyone?.id && has(o.deny, P.VIEW_CHANNEL));
 
 // ---------- chats ----------
 async function resolveChat(db, u, body, { forSend = false } = {}) {
-  if (body.channel != null) throw new HttpError(404, "Server channels aren't built yet.");
+  if (body.channel != null) {
+    const cc = await channelCtx(db, u, Number(body.channel));
+    if (cc.channel.kind !== "text") throw new HttpError(400, "That's a voice channel.");
+    return { chat: `c:${cc.channel.id}`, channel: cc.channel, perms: cc.perms, acc: cc.acc };
+  }
   if (body.party != null) {
     const id = Number(body.party);
     const m = Number.isInteger(id) && await db.prepare("SELECT 1 AS x FROM party_members WHERE party_id = ? AND user_id = ?").bind(id, u.id).first();
     if (!m) throw new HttpError(404, "That group chat doesn't exist.");
     return { chat: `p:${id}`, party: id };
   }
-  const name = body.dm ?? body.to;
+  const name = body.with ?? body.dm ?? body.to; // the launcher sends { with } to load/type, { to } to send
   const other = await userByName(db, name);
   if (!other || other.id === u.id) throw new HttpError(404, "That person doesn't exist.");
   if (forSend && (await isBlocked(db, u.id, other.id))) throw new HttpError(403, "You can't message this person.");
@@ -135,6 +150,7 @@ async function chatOfMessage(db, u, id) {
   if (!m) throw new HttpError(404, "That message doesn't exist.");
   if (m.chat.startsWith("dm:")) { const [a, b] = m.chat.split(":").slice(1).map(Number); if (u.id !== a && u.id !== b) throw new HttpError(404, "That message doesn't exist."); }
   else if (m.chat.startsWith("p:")) { if (!(await db.prepare("SELECT 1 AS x FROM party_members WHERE party_id = ? AND user_id = ?").bind(Number(m.chat.slice(2)), u.id).first())) throw new HttpError(404, "That message doesn't exist."); }
+  else if (m.chat.startsWith("c:")) { const cc = await channelCtx(db, u, Number(m.chat.slice(2))); m.perms = cc.perms; m.inChannel = true; }
   else throw new HttpError(404, "That message doesn't exist.");
   return m;
 }
@@ -162,8 +178,10 @@ async function shapeMessages(db, u, rows) {
 }
 const MSG_SELECT = "SELECT m.*, o.name, o.avatar, o.avatar_v FROM messages m JOIN users o ON o.id = m.author";
 
-async function markRead(db, u, chat) {
+async function markRead(db, u, chat, { quiet = false } = {}) {
   const last = await db.prepare("SELECT MAX(id) AS id FROM messages WHERE chat = ?").bind(chat).first();
+  const before = !quiet && chat.startsWith("dm:") && last?.id ? (await db.prepare("SELECT last_id FROM reads WHERE user_id = ? AND chat = ?").bind(u.id, chat).first())?.last_id || 0 : null;
+  if (before !== null && last.id > before) await notifyChat(db, u, chat, "seen"); // the other person's "Seen" updates at once
   if (last?.id) await db.prepare("INSERT INTO reads (user_id, chat, last_id) VALUES (?,?,?) ON CONFLICT(user_id, chat) DO UPDATE SET last_id = MAX(last_id, excluded.last_id)").bind(u.id, chat, last.id).run();
 }
 
@@ -192,6 +210,7 @@ export const socialRoutes = {
     if (f && f.requester === u.id) throw new HttpError(400, `You already sent ${t.name} a request.`);
     if (f) await db.prepare("UPDATE friendships SET accepted = 1, accepted_at = ? WHERE lo = ? AND hi = ?").bind(Date.now(), lo, hi).run(); // they'd asked us first
     else { await db.prepare("INSERT INTO friendships (lo, hi, requester, accepted, created) VALUES (?,?,?,0,?)").bind(lo, hi, u.id, Date.now()).run(); await recordFail(db, `freq:${u.id}`); }
+    await emitUsers(db, [t.id], { t: "sync" });
   }),
   respond: withSync(async ({ db, body }, u) => {
     const t = await userByName(db, body.name), [lo, hi] = t ? pair(u.id, t.id) : [0, 0];
@@ -199,14 +218,15 @@ export const socialRoutes = {
     if (!f) throw new HttpError(404, "That request isn't there anymore.");
     if (body.accept) await db.prepare("UPDATE friendships SET accepted = 1, accepted_at = ? WHERE lo = ? AND hi = ?").bind(Date.now(), lo, hi).run();
     else await db.prepare("DELETE FROM friendships WHERE lo = ? AND hi = ?").bind(lo, hi).run();
+    await emitUsers(db, [t.id], { t: "sync" });
   }),
   cancel: withSync(async ({ db, body }, u) => {
     const t = await userByName(db, body.name);
-    if (t) { const [lo, hi] = pair(u.id, t.id); await db.prepare("DELETE FROM friendships WHERE lo = ? AND hi = ? AND accepted = 0 AND requester = ?").bind(lo, hi, u.id).run(); }
+    if (t) { const [lo, hi] = pair(u.id, t.id); await db.prepare("DELETE FROM friendships WHERE lo = ? AND hi = ? AND accepted = 0 AND requester = ?").bind(lo, hi, u.id).run(); await emitUsers(db, [t.id], { t: "sync" }); }
   }),
   remove: withSync(async ({ db, body }, u) => {
     const t = await userByName(db, body.name);
-    if (t) { const [lo, hi] = pair(u.id, t.id); await db.prepare("DELETE FROM friendships WHERE lo = ? AND hi = ?").bind(lo, hi).run(); }
+    if (t) { const [lo, hi] = pair(u.id, t.id); await db.prepare("DELETE FROM friendships WHERE lo = ? AND hi = ?").bind(lo, hi).run(); await emitUsers(db, [t.id], { t: "sync" }); }
   }),
   block: withSync(async ({ db, body }, u) => {
     const t = await userByName(db, body.name);
@@ -225,6 +245,7 @@ export const socialRoutes = {
     const u = await requireUser(db, req);
     if (await tooMany(db, `send:${u.id}`, 30, 30_000)) throw new HttpError(429, "Slow down a little.");
     const c = await resolveChat(db, u, body, { forSend: true });
+    if (c.channel && !has(c.perms, P.SEND_MESSAGES)) throw new HttpError(403, "You can't send messages in this channel.");
     let text = typeof body.body === "string" ? body.body.replace(/\r\n/g, "\n").trim() : "";
     if (!text) throw new HttpError(400, "Write something first.");
     if (text.length > MSG_MAX) throw new HttpError(400, `Messages can be up to ${MSG_MAX} characters.`);
@@ -233,12 +254,19 @@ export const socialRoutes = {
       if (!m || (m[1] === "img" && !/^::img::[0-9a-f]{32}$/.test(text)) || text.length > 300) throw new HttpError(400, "That message isn't allowed.");
       if (m[1] === "img" && !(await db.prepare("SELECT 1 AS x FROM images WHERE id = ? AND owner = ?").bind(text.slice(7), u.id).first())) throw new HttpError(400, "That picture isn't yours.");
     }
+    if (c.channel) {
+      if (text.startsWith("::img::") && !has(c.perms, P.ATTACH_FILES)) throw new HttpError(403, "You can't attach pictures here.");
+      if (/(^|\s)@(everyone|here)\b/.test(text) && !has(c.perms, P.MENTION_EVERYONE)) throw new HttpError(403, "You can't mention everyone here.");
+      for (const m of text.matchAll(/<@&(\d+)>/g)) { const r = c.acc.roles.find((x) => x.id === Number(m[1])); if (r && !r.mentionable && !has(c.perms, P.MENTION_EVERYONE)) throw new HttpError(403, "You can't mention that role."); }
+    }
     let reply = null;
     if (body.reply != null) { const r = await db.prepare("SELECT id FROM messages WHERE id = ? AND chat = ? AND deleted = 0").bind(Number(body.reply), c.chat).first(); reply = r?.id ?? null; }
     const now = Date.now();
     const r = await db.prepare("INSERT INTO messages (chat, author, body, created, updated, reply) VALUES (?,?,?,?,?,?)").bind(c.chat, u.id, text, now, now, reply).run();
     await recordFail(db, `send:${u.id}`);
-    await markRead(db, u, c.chat);
+    await markRead(db, u, c.chat, { quiet: true }); // your own message isn't "reading"
+    await notifyChat(db, u, c.chat, "msg", { priv: isPrivate(c) });
+    if (c.channel) await notifyMentions(db, u, c.acc.server.id, c.channel.id, text);
     return json({ ok: true, id: r.meta.last_row_id });
   },
 
@@ -246,6 +274,7 @@ export const socialRoutes = {
     const u = await requireUser(db, req);
     const c = await resolveChat(db, u, body);
     const now = Date.now();
+    if (c.channel && !has(c.perms, P.READ_HISTORY)) return json({ messages: [], more: false, now, seenUpTo: 0, perms: c.perms });
     let rows, more = false;
     if (Number(body.before) > 0) {
       rows = (await db.prepare(`${MSG_SELECT} WHERE m.chat = ? AND m.deleted = 0 AND m.id < ? ORDER BY m.id DESC LIMIT ?`).bind(c.chat, Number(body.before), PAGE + 1).all()).results;
@@ -261,7 +290,7 @@ export const socialRoutes = {
     await markRead(db, u, c.chat);
     let seenUpTo = 0;
     if (c.other) seenUpTo = (await db.prepare("SELECT last_id FROM reads WHERE user_id = ? AND chat = ?").bind(c.other.id, c.chat).first())?.last_id || 0;
-    return json({ messages, more, now, seenUpTo, perms: 0 });
+    return json({ messages, more, now, seenUpTo, perms: c.channel ? c.perms : 0 });
   },
 
   async edit({ db, req, body }) {
@@ -272,6 +301,7 @@ export const socialRoutes = {
     if (!text || text.length > MSG_MAX || text.startsWith("::")) throw new HttpError(400, "That message isn't allowed.");
     const now = Date.now();
     await db.prepare("UPDATE messages SET body = ?, edited = ?, updated = ? WHERE id = ?").bind(text, now, now, m.id).run();
+    await notifyChat(db, u, m.chat, "edit", { priv: true });
     return json({ ok: true });
   },
 
@@ -279,15 +309,17 @@ export const socialRoutes = {
     const u = await requireUser(db, req);
     const m = await chatOfMessage(db, u, Number(body.id));
     const owner = m.chat.startsWith("p:") && (await db.prepare("SELECT owner FROM parties WHERE id = ?").bind(Number(m.chat.slice(2))).first())?.owner === u.id;
-    if (m.author !== u.id && !owner) throw new HttpError(403, "You can't delete that message.");
+    if (m.author !== u.id && !owner && !(m.inChannel && has(m.perms, P.MANAGE_MESSAGES))) throw new HttpError(403, "You can't delete that message.");
     await db.prepare("DELETE FROM reactions WHERE message_id = ?").bind(m.id).run();
     await db.prepare("UPDATE messages SET deleted = 1, body = '', pinned = 0, updated = ? WHERE id = ?").bind(Date.now(), m.id).run();
+    await notifyChat(db, u, m.chat, "edit", { priv: true });
     return json({ ok: true });
   },
 
   async react({ db, req, body }) {
     const u = await requireUser(db, req);
     const m = await chatOfMessage(db, u, Number(body.id));
+    if (m.inChannel && !has(m.perms, P.ADD_REACTIONS)) throw new HttpError(403, "You can't react here.");
     const emoji = str(body.emoji, 64);
     if (m.deleted || !emoji || /\s/.test(emoji) || /[<>"]/.test(emoji)) throw new HttpError(400, "That reaction isn't allowed.");
     const had = await db.prepare("SELECT 1 AS x FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?").bind(m.id, u.id, emoji).first();
@@ -298,6 +330,7 @@ export const socialRoutes = {
       await db.prepare("INSERT INTO reactions (message_id, user_id, emoji, created) VALUES (?,?,?,?)").bind(m.id, u.id, emoji, Date.now()).run();
     }
     await db.prepare("UPDATE messages SET updated = ? WHERE id = ?").bind(Date.now(), m.id).run();
+    await notifyChat(db, u, m.chat, "edit", { priv: true });
     return json({ ok: true });
   },
 
@@ -305,7 +338,9 @@ export const socialRoutes = {
     const u = await requireUser(db, req);
     const m = await chatOfMessage(db, u, Number(body.id));
     if (m.deleted) throw new HttpError(404, "That message doesn't exist.");
+    if (m.inChannel && !has(m.perms, P.MANAGE_MESSAGES)) throw new HttpError(403, "You need the Manage Messages permission to pin.");
     await db.prepare("UPDATE messages SET pinned = ?, updated = ? WHERE id = ?").bind(body.pinned ? 1 : 0, Date.now(), m.id).run();
+    await notifyChat(db, u, m.chat, "edit", { priv: true });
     return json({ ok: true });
   },
   async pins({ db, req, body }) {
@@ -314,7 +349,16 @@ export const socialRoutes = {
     const rows = (await db.prepare(`${MSG_SELECT} WHERE m.chat = ? AND m.pinned = 1 AND m.deleted = 0 ORDER BY m.id DESC LIMIT 100`).bind(c.chat).all()).results;
     return json({ pins: await shapeMessages(db, u, rows) });
   },
-  async typing({ db, req }) { await requireUser(db, req); return json({ ok: true }); }, // delivered live once the socket exists
+  async typing({ db, req, body }) {
+    const u = await requireUser(db, req);
+    const c = await resolveChat(db, u, body, { forSend: true }).catch(() => null);
+    if (!c || (c.channel && !has(c.perms, P.SEND_MESSAGES))) return json({ ok: true });
+    const key = `${u.id}:${c.chat}`, now = Date.now();
+    if (now - (typingAt.get(key) || 0) < 2_000) return json({ ok: true });
+    typingAt.set(key, now); if (typingAt.size > 5000) typingAt.clear();
+    await notifyChat(db, u, c.chat, "typing", { priv: isPrivate(c) });
+    return json({ ok: true });
+  },
 
   async image({ db, req, body }) {
     const u = await requireUser(db, req);
@@ -345,6 +389,7 @@ export const socialRoutes = {
     const r = await db.prepare("INSERT INTO parties (name, owner, created) VALUES (?,?,?)").bind(name, u.id, Date.now()).run();
     const id = r.meta.last_row_id;
     for (const p of [u, ...people]) await db.prepare("INSERT INTO party_members (party_id, user_id) VALUES (?,?)").bind(id, p.id).run();
+    await emitUsers(db, people.map((p) => p.id), { t: "sync" });
     return { party: id };
   }),
   party_add: withSync(async ({ db, body }, u) => {
@@ -355,12 +400,14 @@ export const socialRoutes = {
     const n = await db.prepare("SELECT COUNT(*) AS n FROM party_members WHERE party_id = ?").bind(id).first();
     if (n.n >= PARTY_MAX) throw new HttpError(400, `Groups can have up to ${PARTY_MAX} people.`);
     await db.prepare("INSERT OR IGNORE INTO party_members (party_id, user_id) VALUES (?,?)").bind(id, t.id).run();
+    await emitUsers(db, (await db.prepare("SELECT user_id FROM party_members WHERE party_id = ? AND user_id != ?").bind(id, u.id).all()).results.map((r) => r.user_id), { t: "sync" });
   }),
   party_rename: withSync(async ({ db, body }, u) => {
     const id = Number(body.id), name = str(body.name, 40);
     if (!name) throw new HttpError(400, "Give the group a name.");
     if (!(await db.prepare("SELECT 1 AS x FROM party_members WHERE party_id = ? AND user_id = ?").bind(id, u.id).first())) throw new HttpError(404, "That group chat doesn't exist.");
     await db.prepare("UPDATE parties SET name = ? WHERE id = ?").bind(name, id).run();
+    await emitUsers(db, (await db.prepare("SELECT user_id FROM party_members WHERE party_id = ? AND user_id != ?").bind(id, u.id).all()).results.map((r) => r.user_id), { t: "sync" });
   }),
   party_leave: withSync(async ({ db, body }, u) => {
     const id = Number(body.id);
@@ -370,7 +417,10 @@ export const socialRoutes = {
       await db.prepare("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE chat = ?)").bind(`p:${id}`).run();
       await db.prepare("DELETE FROM messages WHERE chat = ?").bind(`p:${id}`).run();
       await db.prepare("DELETE FROM parties WHERE id = ?").bind(id).run();
-    } else await db.prepare("UPDATE parties SET owner = ? WHERE id = ? AND owner = ?").bind(rest.user_id, id, u.id).run();
+    } else {
+      await db.prepare("UPDATE parties SET owner = ? WHERE id = ? AND owner = ?").bind(rest.user_id, id, u.id).run();
+      await emitUsers(db, (await db.prepare("SELECT user_id FROM party_members WHERE party_id = ?").bind(id).all()).results.map((r) => r.user_id), { t: "sync" });
+    }
   }),
 
   // ----- placeholders: valid empty answers until the achievements slice exists -----
